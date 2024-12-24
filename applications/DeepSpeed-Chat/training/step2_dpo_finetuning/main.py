@@ -5,7 +5,6 @@
 # DeepSpeed Team
 import argparse
 import math
-
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -229,6 +228,38 @@ def get_batch_logps(logits, input_ids, label_mask):
     return (per_token_logps * label_mask).sum(-1)
 
 
+def compute_dpo_loss(model_outputs, ref_outputs, batch, tokenizer, args):
+    batch_size = batch['input_ids'].shape[0] // 2
+    chosen_input_ids = batch['input_ids'][:batch_size]
+    rejected_input_ids = batch['input_ids'][batch_size:]
+    label_mask = (batch['input_ids'] != tokenizer.pad_token_id).int()
+    for i in range(batch_size):
+        divergence_ind = (chosen_input_ids[i] != rejected_input_ids[i]).nonzero().squeeze(-1)
+        if len(divergence_ind) > 0:
+            divergence_ind = divergence_ind[0]
+        else:
+            divergence_ind = 0
+        label_mask[i][:divergence_ind] = 0
+        label_mask[i + batch_size][:divergence_ind] = 0
+
+    logps = get_batch_logps(model_outputs.logits, batch['input_ids'], label_mask)
+    ref_logps = get_batch_logps(ref_outputs.logits, batch['input_ids'], label_mask)
+
+    chosen_logps = logps[:batch_size]
+    rejected_logps = logps[batch_size:]
+    ref_chosen_logps = ref_logps[:batch_size]
+    ref_rejected_logps = ref_logps[batch_size:]
+
+    logits = args.beta * ((chosen_logps - ref_chosen_logps) - (rejected_logps - ref_rejected_logps))
+    loss = (- torch.nn.functional.logsigmoid(logits) * (1 - args.label_smoothing) - \
+            torch.nn.functional.logsigmoid(-logits) * args.label_smoothing).mean(0)
+
+    chosen_rewards = args.beta * (chosen_logps - ref_chosen_logps).detach()
+    rejected_rewards = args.beta * (rejected_logps - ref_rejected_logps).detach()
+
+    return loss, chosen_rewards, rejected_rewards
+
+
 def main():
     args = parse_args()
 
@@ -362,46 +393,17 @@ def main():
         losses = 0
         for step, batch in enumerate(eval_dataloader):
             batch = to_device(batch, device)
-            batch_size = batch['input_ids'].shape[0] // 2
-            chosen_input_ids = batch['input_ids'][:batch_size]
-            rejected_input_ids = batch['input_ids'][batch_size:]
-            label_mask = (batch['input_ids'] != tokenizer.pad_token_id).int()
-            for i in range(batch_size):
-                divergence_ind = (chosen_input_ids[i] !=
-                                  rejected_input_ids[i]).nonzero().squeeze(-1)
-                if len(divergence_ind) > 0:
-                    divergence_ind = divergence_ind[0]
-                else:
-                    divergence_ind = 0
-                label_mask[i][:divergence_ind] = 0
-                label_mask[i + batch_size][:divergence_ind] = 0
             with torch.no_grad():
                 outputs = model(**batch)
                 ref_outputs = ref_model(**batch)
 
-            logps = get_batch_logps(outputs.logits, batch['input_ids'],
-                                    label_mask)
-            ref_logps = get_batch_logps(ref_outputs.logits, batch['input_ids'],
-                                        label_mask)
-
-            chosen_logps = logps[:batch_size]
-            rejected_logps = logps[batch_size:]
-            ref_chosen_logps = ref_logps[:batch_size]
-            ref_rejected_logps = ref_logps[batch_size:]
-
-            logits = args.beta * ((chosen_logps - ref_chosen_logps) -
-                                  (rejected_logps - ref_rejected_logps))
-            loss = (- torch.nn.functional.logsigmoid(logits) * (1 - args.label_smoothing) - \
-                    torch.nn.functional.logsigmoid(-logits) * args.label_smoothing).mean(0)
+            loss, chosen_rewards, rejected_rewards = compute_dpo_loss(outputs, ref_outputs, batch, tokenizer, args)
             losses += loss.float()
         losses = losses / (step + 1)
         try:
             losses = get_all_reduce_mean(losses)
         except:
             pass
-        chosen_rewards = args.beta * (chosen_logps - ref_chosen_logps).detach()
-        rejected_rewards = args.beta * (rejected_logps -
-                                        ref_rejected_logps).detach()
         return chosen_rewards.mean().item(), rejected_rewards.mean().item(
         ), losses.item()
 
@@ -456,41 +458,15 @@ def main():
         for step, batch in enumerate(train_dataloader):
             start = time.time()
             batch = to_device(batch, device)
-            batch_size = batch['input_ids'].shape[0] // 2
-            chosen_input_ids = batch['input_ids'][:batch_size]
-            rejected_input_ids = batch['input_ids'][batch_size:]
-            label_mask = (batch['input_ids'] != tokenizer.pad_token_id).int()
-            for i in range(batch_size):
-                divergence_ind = (chosen_input_ids[i] !=
-                                  rejected_input_ids[i]).nonzero().squeeze(-1)
-                if len(divergence_ind) > 0:
-                    divergence_ind = divergence_ind[0]
-                else:
-                    divergence_ind = 0
-                label_mask[i][:divergence_ind] = 0
-                label_mask[i + batch_size][:divergence_ind] = 0
             outputs = model(**batch, use_cache=False)
             with torch.no_grad():
                 ref_outputs = ref_model(**batch)
 
-            logps = get_batch_logps(outputs.logits, batch['input_ids'],
-                                    label_mask)
-            ref_logps = get_batch_logps(ref_outputs.logits, batch['input_ids'],
-                                        label_mask)
-
-            chosen_logps = logps[:batch_size]
-            rejected_logps = logps[batch_size:]
-            ref_chosen_logps = ref_logps[:batch_size]
-            ref_rejected_logps = ref_logps[batch_size:]
-
-            logits = args.beta * ((chosen_logps - ref_chosen_logps) -
-                                  (rejected_logps - ref_rejected_logps))
-            loss = (- torch.nn.functional.logsigmoid(logits) * (1 - args.label_smoothing) - \
-                    torch.nn.functional.logsigmoid(-logits) * args.label_smoothing).mean(0)
+            loss, chosen_rewards, rejected_rewards = compute_dpo_loss(outputs, ref_outputs, batch, tokenizer, args)
             if args.print_loss:
                 print(
                     f"Epoch: {epoch}, Step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}"
-                )
+                )   
             model.backward(loss)
             model.step()
             end = time.time()
